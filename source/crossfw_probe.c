@@ -12,7 +12,7 @@
 #include <errno.h>
 
 #define BACKUP_ROOT "/mnt/usb0/PS5/EXPORT/BACKUP"
-#define LOG_PATH BACKUP_ROOT "/crossfw_probe.log"
+#define LOG_PATH BACKUP_ROOT "/crossfw_matrix.log"
 
 static FILE *log_file = NULL;
 
@@ -22,8 +22,6 @@ static void log_line(const char *fmt, ...) {
     vprintf(fmt, args);
     va_end(args);
 
-    if (!log_file)
-        log_file = fopen(LOG_PATH, "a");
     if (log_file) {
         va_start(args, fmt);
         vfprintf(log_file, fmt, args);
@@ -34,12 +32,14 @@ static void log_line(const char *fmt, ...) {
 
 static void dump_diag(const char *stage) {
     const bar_diag_result *d = bar_get_last_diag();
-    log_line("[BAR] %-18s request=0x%08lx ioctl_ret=%d errno=%d status=0x%016lx context=%d\n",
+    int32_t status32 = (int32_t)(uint32_t)d->status;
+    log_line("[BAR] %-24s request=0x%08lx ioctl_ret=%d errno=%d status=0x%016lx status32=%d context=%d\n",
              stage,
              d->request,
              d->ioctl_ret,
              d->ioctl_errno,
              (unsigned long)d->status,
+             status32,
              d->context);
 }
 
@@ -96,11 +96,100 @@ static void print_hex(const char *label, const uint8_t *buf, size_t size) {
     log_line("\n");
 }
 
+static int run_version_probe(
+    int test_version,
+    const bar_file_header *header,
+    const bar_file_segment_metadata *metadata,
+    size_t metadata_size,
+    const bar_file_segment_hash *hashes,
+    size_t hashes_size,
+    const uint8_t complete_hash[0x20]
+) {
+    int context = 0;
+    int ret = -1;
+    char stage[64];
+
+    log_line("\n=== MATRIX TEST: context version=%d (archive header version=%d) ===\n",
+             test_version, header->version);
+    log_line("Only the version argument passed to context_init is changed. BAR bytes/AAD remain untouched.\n");
+
+    ret = bar_context_create(&context);
+    snprintf(stage, sizeof(stage), "v%d context_create", test_version);
+    dump_diag(stage);
+    if (ret != 0) {
+        log_line("RESULT[v%d]: CONTEXT_CREATE_REJECTED ret=%d\n", test_version, ret);
+        goto cleanup;
+    }
+
+    ret = bar_context_init(context, test_version, header->mode, (uint8_t *)header->key, (uint8_t *)header->iv);
+    snprintf(stage, sizeof(stage), "v%d context_init", test_version);
+    dump_diag(stage);
+    if (ret != 0) {
+        log_line("RESULT[v%d]: INIT_REJECTED ret=%d\n", test_version, ret);
+        goto cleanup;
+    }
+
+    log_line("RESULT[v%d]: INIT_ACCEPTED\n", test_version);
+
+    ret = bar_update_aad(context, (void *)header, sizeof(*header));
+    snprintf(stage, sizeof(stage), "v%d aad_header", test_version);
+    dump_diag(stage);
+    if (ret != 0) {
+        log_line("RESULT[v%d]: AAD_HEADER_REJECTED ret=%d\n", test_version, ret);
+        goto cleanup;
+    }
+
+    ret = bar_update_aad(context, (void *)metadata, (int)metadata_size);
+    snprintf(stage, sizeof(stage), "v%d aad_metadata", test_version);
+    dump_diag(stage);
+    if (ret != 0) {
+        log_line("RESULT[v%d]: AAD_METADATA_REJECTED ret=%d\n", test_version, ret);
+        goto cleanup;
+    }
+
+    ret = bar_update_aad(context, (void *)hashes, (int)hashes_size);
+    snprintf(stage, sizeof(stage), "v%d aad_hashes", test_version);
+    dump_diag(stage);
+    if (ret != 0) {
+        log_line("RESULT[v%d]: AAD_HASHES_REJECTED ret=%d\n", test_version, ret);
+        goto cleanup;
+    }
+
+    ret = bar_finish_decrypt(context, (uint8_t *)complete_hash);
+    snprintf(stage, sizeof(stage), "v%d finish_decrypt", test_version);
+    dump_diag(stage);
+    if (ret == 0)
+        log_line("RESULT[v%d]: HEADER_AUTH_ACCEPTED\n", test_version);
+    else
+        log_line("RESULT[v%d]: HEADER_AUTH_REJECTED ret=%d\n", test_version, ret);
+
+cleanup:
+    if (context) {
+        int destroy_ret = bar_context_destroy(context);
+        snprintf(stage, sizeof(stage), "v%d context_destroy", test_version);
+        dump_diag(stage);
+        if (destroy_ret != 0)
+            log_line("v%d context_destroy returned %d\n", test_version, destroy_ret);
+    }
+
+    /* Make each matrix attempt independent and force a fresh /dev/bar open. */
+    close_bar_fd();
+    return ret;
+}
+
+static int add_unique_version(int versions[], int count, int version) {
+    for (int i = 0; i < count; i++) {
+        if (versions[i] == version)
+            return count;
+    }
+    versions[count++] = version;
+    return count;
+}
+
 int main(void) {
     char archive_path[512];
     int fd = -1;
-    int ret = -1;
-    int context = 0;
+    int exit_code = 1;
     bar_file_header header;
     bar_file_segment_metadata *metadata = NULL;
     bar_file_segment_hash *hashes = NULL;
@@ -109,8 +198,11 @@ int main(void) {
     memset(&header, 0, sizeof(header));
     memset(complete_hash, 0, sizeof(complete_hash));
 
-    log_line("\n=== ps5-bar-tool crossfw probe ===\n");
-    log_line("Read-only test: header authentication only; no BAR data is modified.\n");
+    /* Start a fresh log on every launch so results from different BARs cannot mix. */
+    log_file = fopen(LOG_PATH, "w");
+
+    log_line("=== ps5-bar-tool crossfw version matrix ===\n");
+    log_line("Read-only BAR test. The archive itself is never modified.\n");
 
     if (find_archive(archive_path, sizeof(archive_path)) != 0) {
         log_line("Could not find archive.dat below %s\n", BACKUP_ROOT);
@@ -175,47 +267,20 @@ int main(void) {
     print_hex("Header auth[0:16]: ", complete_hash, 0x10);
     print_hex("Header auth[16:32]: ", complete_hash + 0x10, 0x10);
 
-    log_line("\n-- /dev/bar header-authentication probe --\n");
+    int versions[3];
+    int version_count = 0;
+    version_count = add_unique_version(versions, version_count, header.version);
+    version_count = add_unique_version(versions, version_count, 12);
+    version_count = add_unique_version(versions, version_count, 13);
 
-    ret = bar_context_create(&context);
-    dump_diag("context_create");
-    if (ret != 0)
-        goto cleanup;
+    log_line("\n-- /dev/bar compatibility matrix --\n");
+    for (int i = 0; i < version_count; i++)
+        run_version_probe(versions[i], &header, metadata, metadata_size, hashes, hashes_size, complete_hash);
 
-    ret = bar_context_init(context, header.version, header.mode, header.key, header.iv);
-    dump_diag("context_init");
-    if (ret != 0)
-        goto cleanup;
-
-    ret = bar_update_aad(context, &header, sizeof(header));
-    dump_diag("aad_header");
-    if (ret != 0)
-        goto cleanup;
-
-    ret = bar_update_aad(context, metadata, (int)metadata_size);
-    dump_diag("aad_metadata");
-    if (ret != 0)
-        goto cleanup;
-
-    ret = bar_update_aad(context, hashes, (int)hashes_size);
-    dump_diag("aad_hashes");
-    if (ret != 0)
-        goto cleanup;
-
-    ret = bar_finish_decrypt(context, complete_hash);
-    dump_diag("finish_decrypt");
-    if (ret == 0)
-        log_line("RESULT: HEADER AUTH ACCEPTED by this firmware.\n");
-    else
-        log_line("RESULT: HEADER AUTH REJECTED at finish_decrypt (ret=%d).\n", ret);
+    log_line("\n=== MATRIX COMPLETE ===\n");
+    exit_code = 0;
 
 cleanup:
-    if (context) {
-        int destroy_ret = bar_context_destroy(context);
-        dump_diag("context_destroy");
-        if (destroy_ret != 0)
-            log_line("context_destroy returned %d\n", destroy_ret);
-    }
     close_bar_fd();
     if (fd >= 0)
         close(fd);
@@ -224,5 +289,5 @@ cleanup:
     if (log_file)
         fclose(log_file);
 
-    return ret == 0 ? 0 : 1;
+    return exit_code;
 }
