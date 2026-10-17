@@ -34,6 +34,20 @@ typedef struct _bar_update_aad_args
     uint64_t    status;
 } bar_update_aad_args;
 
+// Captures the raw result of the most recent /dev/bar ioctl.  The normal
+// wrappers keep their existing return-value semantics; research/probe payloads
+// can use this structure to distinguish ioctl failures from device status.
+typedef struct _bar_diag_result
+{
+    unsigned long request;
+    int           ioctl_ret;
+    int           ioctl_errno;
+    uint64_t      status;
+    int           context;
+} bar_diag_result;
+
+const bar_diag_result* bar_get_last_diag(void);
+
 int bar_context_create (int* context);
 
 int bar_context_destroy (int context);
