@@ -57,6 +57,20 @@ This rules out a simple alias to an older accepted protocol version on FW 13.60.
 
 Calling `BAR_FINISH_DECRYPT` with the segment-table 16-byte value returns low32 `-36` even for the native v12 archive whose decrypted plaintext is demonstrably correct. The upstream segment-decrypt path does not use `BAR_FINISH_DECRYPT` after each segment either. Therefore that value/result must not currently be treated as a valid per-segment authentication oracle.
 
+## BAR device/module inventory probe
+
+A read-only probe opened `/dev/bar` and called `fstat()` successfully:
+
+- `st_ino = 0x56`
+- `st_rdev = 0x56`
+- `st_mode = 0x2180`
+
+The same probe attempted FreeBSD `kldnext`/`kldstat` and `modnext`/`modstat` enumeration. All of those raw syscall stubs returned decimal `78` with libc `errno` still zero. In the PS5 SDK's FreeBSD errno table, `78` is `ENOSYS` (`Function not implemented`). Because the SDK syscall stubs return the raw kernel value directly, the first version of the probe incorrectly treated `78` as a KLD/module identifier and repeated it until its safety loop limits (512 and 2048 iterations).
+
+Therefore there is no evidence for a real KLD or module with ID 78. The useful conclusion is instead that the standard KLD/module enumeration syscalls are unavailable from this payload context on FW 13.60.
+
+The next offline approach is to use the captured kernel data layout plus the FreeBSD `struct cdev` / `struct cdevsw` layout to look for the in-memory `/dev/bar` device object and its `d_ioctl` handler pointer. `tools/scan_bar_cdev.py` implements this as a read-only scan of the existing kernel RAM reconstruction.
+
 ## Current conclusion
 
-FW 13.60 can parse and decrypt its native BAR v12 data but does not have a directly usable v13 context through the tested `/dev/bar` API. A v13 archive cannot be recovered by merely substituting any older context version 1..12. Further work should focus on the implementation/derivation difference for BAR context version 13 or on executing the BAR API on a firmware that natively supports v13.
+FW 13.60 can parse and decrypt its native BAR v12 data but does not have a directly usable v13 context through the tested `/dev/bar` API. A v13 archive cannot be recovered by merely substituting any older context version 1..12. Standard KLD/module enumeration is also unavailable (`ENOSYS`) in the tested payload context, so implementation research is moving to offline identification of `/dev/bar`'s `cdevsw` and `d_ioctl` path in the existing 13.60 kernel RAM capture.
