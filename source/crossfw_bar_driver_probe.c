@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/param.h>
 #include <sys/linker.h>
 #include <sys/module.h>
 
